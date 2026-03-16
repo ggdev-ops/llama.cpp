@@ -1,0 +1,8 @@
+[versions]
+javaVersion = "21"
+androidCompileSdk = "36"
+androidMinSdk = "26"
+androidTargetSdk = "36"
+
+
+
