@@ -91,7 +91,8 @@
 !/examples/*/*/*.kts
 !/examples/sycl/*.bat
 !/examples/sycl/*.sh
-
+/examples/klama.ai
+/examples/tmpDocs
 # Server Web UI temporary files
 /tools/server/webui/node_modules
 /tools/server/webui/dist
