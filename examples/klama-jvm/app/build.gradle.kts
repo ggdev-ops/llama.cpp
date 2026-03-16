@@ -1,14 +1,9 @@
-import org.gradle.api.tasks.Exec
-import org.jetbrains.kotlin.gradle.ExperimentalKotlinGradlePluginApi
+//import org.gradle.api.tasks.Exec
 
 plugins {
     kotlin("jvm") version "2.3.10"
     application
 }
-
-//kotlin {
-//    jvmToolchain(21)
-//}
 
 repositories {
     mavenCentral()
@@ -17,16 +12,11 @@ repositories {
 dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.7.3")
     implementation("com.varabyte.kotter:kotter:1.2.1")
-    implementation("com.github.ajalt.clikt:clikt:4.2.2")
+    implementation("com.squareup.okio:okio:3.9.0")
 }
 
 application {
     mainClass.set("com.arm.aichat.main.MainKt")
-}
-
-tasks.withType<JavaExec> {
-    standardInput = System.`in`
-    args = project.findProperty("modelPath")?.let { listOf(it.toString()) } ?: emptyList()
 }
 
 tasks.withType<JavaExec> {
@@ -84,4 +74,3 @@ tasks.named("run") {
 tasks.named("assemble") {
     dependsOn(cmakeBuild)
 }
-

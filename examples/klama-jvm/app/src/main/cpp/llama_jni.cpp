@@ -6,670 +6,409 @@
 #include <sstream>
 #include <iostream>
 #include <thread>
-#include <unistd.h>
 
 #include "llama.h"
 #include "common.h"
 #include "chat.h"
 #include "sampling.h"
 
-// Desktop logging (mimicking Android's log levels)
-#define LOGv(...) do { if (g_log_level >= 0) printf(" [VERBOSE] " __VA_ARGS__); printf("\n"); } while(0)
-#define LOGd(...) do { if (g_log_level >= 1) printf(" [DEBUG] " __VA_ARGS__); printf("\n"); } while(0)
+// Desktop logging
 #define LOGi(...) printf(" [INFO] " __VA_ARGS__); printf("\n")
-#define LOGw(...) printf(" [WARN] " __VA_ARGS__); printf("\n")
 #define LOGe(...) fprintf(stderr, " [ERROR] " __VA_ARGS__); fprintf(stderr, "\n")
+#define LOGw(...) printf(" [WARN] " __VA_ARGS__); printf("\n")
 
-// Global log level (0=verbose, 1=debug, 2=info, 3=warn, 4=error)
-static int g_log_level = 2; // Default to INFO
-
-template<class T>
-static std::string join(const std::vector<T> &values, const std::string &delim) {
-    std::ostringstream str;
-    for (size_t i = 0; i < values.size(); i++) {
-        str << values[i];
-        if (i < values.size() - 1) { str << delim; }
-    }
-    return str.str();
-}
-
-/**
- * LLama resources and configuration
- */
-constexpr int   N_THREADS_MIN           = 2;
-constexpr int   N_THREADS_MAX           = 8;
-constexpr int   N_THREADS_HEADROOM      = 1;  // Leave one core for system
-
-constexpr int   DEFAULT_CONTEXT_SIZE    = 4096;
-constexpr int   OVERFLOW_HEADROOM       = 4;
-constexpr int   BATCH_SIZE              = 512;
-constexpr float DEFAULT_SAMPLER_TEMP    = 0.3f;
-constexpr float DEFAULT_SAMPLER_TOP_P   = 0.95f;
-constexpr int   DEFAULT_SAMPLER_TOP_K   = 40;
-constexpr float DEFAULT_SAMPLER_PENALTY  = 1.1f;
-
+// Static global variables to manage the Llama model and inference state across JNI calls.
+// These are declared static to maintain their state throughout the application's lifecycle
+// and are shared across all JNI calls from the Java/Kotlin side.
 static llama_model   * g_model = nullptr;
 static llama_context * g_context = nullptr;
 static llama_batch     g_batch;
 static common_sampler * g_sampler = nullptr;
 static common_chat_templates_ptr g_chat_templates;
-
-// Store context parameters for recreation
-static llama_context_params g_ctx_params;
-
-/**
- * Long-term states for conversation management
- */
-constexpr const char *ROLE_SYSTEM       = "system";
-constexpr const char *ROLE_USER         = "user";
-constexpr const char *ROLE_ASSISTANT    = "assistant";
-
+// State management
 static std::vector<common_chat_msg> chat_msgs;
-static llama_pos system_prompt_position = 0;
 static llama_pos current_position = 0;
 
-/**
- * Short-term states for generation loop
- */
-static llama_pos stop_generation_position = 0;
-static std::string cached_token_chars;
-static std::ostringstream assistant_ss;
+// State management for chat interactions.
+// `chat_msgs`: Stores the history of chat messages (system and user prompts),
+//              which is crucial for maintaining conversational context.
+// `current_position`: Tracks the current token position within the Llama context,
+//                     essential for managing sequence length and decoding.
 
-// Track the last position in KV cache
-static llama_pos last_kv_pos = -1;
-
+// Callback function for Llama logging.
+// This function redirects internal llama.cpp library logs to standard output,
+// making them visible in the application's logs.
 static void llama_log_callback(ggml_log_level level, const char * text, void * user_data) {
-    (void) user_data;
-    switch (level) {
-        case GGML_LOG_LEVEL_ERROR: fprintf(stderr, "[GGML ERROR] %s", text); break;
-        case GGML_LOG_LEVEL_WARN:  fprintf(stdout, "[GGML WARN] %s", text); break;
-        case GGML_LOG_LEVEL_INFO:  fprintf(stdout, "[GGML INFO] %s", text); break;
-        case GGML_LOG_LEVEL_DEBUG: if (g_log_level <= 1) fprintf(stdout, "[GGML DEBUG] %s", text); break;
-        default:                   fprintf(stdout, "[GGML] %s", text); break;
-    }
+    (void) level; // Cast to void to suppress unused parameter warning.
+    (void) user_data; // Cast to void to suppress unused parameter warning.
+    fputs(text, stdout);
     fflush(stdout);
-}
-
-/**
- * Recreate context (replaces old KV cache clear functions)
- */
-static bool recreate_context() {
-    if (!g_model) {
-        LOGe("Cannot recreate context: model not loaded");
-        return false;
-    }
-    
-    LOGi("Recreating context...");
-    
-    // Free old context if it exists
-    if (g_context) {
-        llama_free(g_context);
-        g_context = nullptr;
-    }
-    
-    // Create new context with same parameters
-    g_context = llama_init_from_model(g_model, g_ctx_params);
-    if (!g_context) {
-        LOGe("Failed to recreate context");
-        return false;
-    }
-    
-    // Reinitialize batch
-    llama_batch_free(g_batch);
-    g_batch = llama_batch_init(BATCH_SIZE, 0, 1);
-    
-    // Reset position tracking
-    last_kv_pos = -1;
-    
-    LOGi("Context recreated successfully");
-    return true;
-}
-
-/**
- * Reset long-term states (conversation history and KV cache)
- */
-static void reset_long_term_states(const bool clear_kv_cache = true) {
-    chat_msgs.clear();
-    system_prompt_position = 0;
-    current_position = 0;
-    stop_generation_position = 0;
-    cached_token_chars.clear();
-    assistant_ss.str("");
-
-    if (clear_kv_cache && g_context) {
-        // Recreate context to clear KV cache
-        if (!recreate_context()) {
-            LOGe("Failed to recreate context during reset");
-        }
-    }
-    last_kv_pos = -1;
-}
-
-/**
- * Reset short-term states (generation loop)
- */
-static void reset_short_term_states() {
-    stop_generation_position = 0;
-    cached_token_chars.clear();
-    assistant_ss.str("");
-}
-
-/**
- * Format and add a message to chat history
- */
-static std::string chat_add_and_format(const std::string &role, const std::string &content) {
-    common_chat_msg new_msg;
-    new_msg.role = role;
-    new_msg.content = content;
-    auto formatted = common_chat_format_single(
-            g_chat_templates.get(), chat_msgs, new_msg, role == ROLE_USER, false);
-    chat_msgs.push_back(new_msg);
-    LOGd("Formatted and added %s message: %s", role.c_str(), formatted.c_str());
-    return formatted;
-}
-
-/**
- * Decode tokens in batches with proper position management
- */
-static int decode_tokens_in_batches(
-        const std::vector<llama_token> &tokens,
-        const llama_pos start_pos,
-        const bool compute_last_logit = false) {
-    
-    LOGd("Decoding %d tokens starting at position %d", (int) tokens.size(), start_pos);
-    
-    // CRITICAL FIX: Verify position continuity
-    if (last_kv_pos >= 0 && start_pos != last_kv_pos + 1) {
-        LOGw("Position discontinuity detected! last_kv_pos=%d, start_pos=%d", last_kv_pos, start_pos);
-        // If we have a discontinuity, we need to recreate context or adjust
-        if (!recreate_context()) {
-            LOGe("Failed to recover from position discontinuity");
-            return 1;
-        }
-        // Reset positions after context recreation
-        current_position = 0;
-        last_kv_pos = -1;
-    }
-    
-    common_batch_clear(g_batch);
-    
-    // Add tokens to batch with sequential positions
-    for (int i = 0; i < (int) tokens.size(); i++) {
-        const llama_token token_id = tokens[i];
-        // Ensure positions are sequential from last_kv_pos + 1
-        const llama_pos position = (last_kv_pos >= 0) ? last_kv_pos + 1 + i : start_pos + i;
-        const bool want_logit = compute_last_logit && (i == (int) tokens.size() - 1);
-        common_batch_add(g_batch, token_id, position, {0}, want_logit);
-        LOGv("Added token %d at position %d", token_id, position);
-    }
-    
-    // Decode batch
-    if (llama_decode(g_context, g_batch) != 0) {
-        LOGe("llama_decode failed");
-        return 1;
-    }
-    
-    // Update last known KV cache position
-    last_kv_pos = (last_kv_pos >= 0) ? last_kv_pos + tokens.size() : start_pos + tokens.size() - 1;
-    LOGd("Updated last_kv_pos to %d", last_kv_pos);
-    
-    return 0;
-}
-
-/**
- * UTF-8 validation
- */
-static bool is_valid_utf8(const char *string) {
-    if (!string) { return true; }
-
-    const auto *bytes = (const unsigned char *) string;
-    int num;
-
-    while (*bytes != 0x00) {
-        if ((*bytes & 0x80) == 0x00) {
-            // U+0000 to U+007F
-            num = 1;
-        } else if ((*bytes & 0xE0) == 0xC0) {
-            // U+0080 to U+07FF
-            num = 2;
-        } else if ((*bytes & 0xF0) == 0xE0) {
-            // U+0800 to U+FFFF
-            num = 3;
-        } else if ((*bytes & 0xF8) == 0xF0) {
-            // U+10000 to U+10FFFF
-            num = 4;
-        } else {
-            return false;
-        }
-
-        bytes += 1;
-        for (int i = 1; i < num; ++i) {
-            if ((*bytes & 0xC0) != 0x80) {
-                return false;
-            }
-            bytes += 1;
-        }
-    }
-    return true;
-}
-
-/**
- * Get available backends (for benchmarking)
- */
-static std::string get_backend() {
-    std::vector<std::string> backends;
-    for (size_t i = 0; i < ggml_backend_reg_count(); i++) {
-        auto *reg = ggml_backend_reg_get(i);
-        std::string name = ggml_backend_reg_name(reg);
-        if (name != "CPU") {
-            backends.push_back(ggml_backend_reg_name(reg));
-        }
-    }
-    return backends.empty() ? "CPU" : join(backends, ",");
 }
 
 extern "C" {
 
+/**
+ * @brief Initializes the Llama backend and sets up a custom logging callback.
+ *
+ * This JNI function is the first point of contact from the Java/Kotlin application
+ * to prepare the native Llama environment.
+ *
+ * Why `extern "C"` and JNIEXPORT/JNICALL:
+ * These keywords ensure that the function is exported with C linkage,
+ * making it discoverable and callable by the Java Virtual Machine (JVM)
+ * through the Java Native Interface (JNI).
+ *
+ * @param env Pointer to the JNI environment, used for interacting with the JVM.
+ * @param jobject Unused, represents the Java object that called this native method.
+ */
 JNIEXPORT void JNICALL
-Java_com_arm_aichat_engine_InferenceEngineImpl_initNative(JNIEnv *env, jobject /*unused*/, jint log_level) {
-    g_log_level = log_level;
+Java_com_arm_aichat_engine_InferenceEngineImpl_initNative(JNIEnv *env, jobject /*unused*/) {
+    // Set a custom logging callback for the llama.cpp library.
+    // This allows messages from the native library to be routed to the application's logging system.
     llama_log_set(llama_log_callback, nullptr);
+    // Initialize the Llama backend. This sets up necessary internal structures and
+    // potentially allocates resources for the underlying GGML library.
     llama_backend_init();
-    LOGi("llama.cpp backend initialized with log level %d", log_level);
+    LOGi("Llama backend initialized with custom logger");
 }
 
+/**
+ * @brief Loads the Llama model from a specified file path.
+ *
+ * This function handles the loading of the neural network model into memory.
+ * It's a critical step before any inference can take place.
+ *
+ * @param env Pointer to the JNI environment.
+ * @param jobject Unused.
+ * @param jmodel_path JNI string containing the path to the Llama model file (.gguf).
+ * @return jint Returns 0 on successful model loading, 1 otherwise.
+ */
 JNIEXPORT jint JNICALL
 Java_com_arm_aichat_engine_InferenceEngineImpl_load(JNIEnv *env, jobject, jstring jmodel_path) {
+    // Convert the Java string to a C-style string for file system access.
     const char *model_path = env->GetStringUTFChars(jmodel_path, 0);
-    LOGi("Loading model from: %s", model_path);
     
+    // Initialize default model parameters.
     llama_model_params model_params = llama_model_default_params();
+    // Enable memory mapping for the model file.
+    // Why mmap: This can significantly reduce memory usage and loading times
+    //           by mapping the file directly into virtual memory, allowing
+    //           the OS to handle page-in/out as needed.
     model_params.use_mmap = true;
     
+    // Load the Llama model from the specified path with the defined parameters.
     g_model = llama_model_load_from_file(model_path, model_params);
+    
+    // Release the C-style string. It's crucial to release resources obtained
+    // from JNIEnv to prevent memory leaks.
     env->ReleaseStringUTFChars(jmodel_path, model_path);
     
-    if (!g_model) {
-        LOGe("Failed to load model");
-        return 1;
-    }
-    
-    LOGi("Model loaded successfully");
-    return 0;
+    // Return 0 for success (model loaded) or 1 for failure.
+    return (g_model != nullptr) ? 0 : 1;
 }
 
+/**
+ * @brief Prepares the Llama context for inference, including thread setup and batch initialization.
+ *
+ * This function sets up the operational environment for the Llama model,
+ * allocating necessary resources and configuring parameters like context size and thread count.
+ *
+ * @param env Pointer to the JNI environment.
+ * @param jobject Unused.
+ * @return jint Returns 0 on successful preparation, 1 otherwise.
+ */
 JNIEXPORT jint JNICALL
-Java_com_arm_aichat_engine_InferenceEngineImpl_prepare(JNIEnv *env, jobject /*unused*/, 
-                                                      jint context_size, jint n_predict) {
-    if (!g_model) {
-        LOGe("Model not loaded");
-        return 1;
-    }
+Java_com_arm_aichat_engine_InferenceEngineImpl_prepare(JNIEnv *env, jobject /*unused*/) {
+    // Get default context parameters.
+    llama_context_params ctx_params = llama_context_default_params();
     
-    // Thread configuration
-    int n_threads = std::thread::hardware_concurrency();
-    n_threads = std::max(N_THREADS_MIN, std::min(N_THREADS_MAX, n_threads - N_THREADS_HEADROOM));
-    LOGi("Using %d threads", n_threads);
+    // Determine the number of threads for inference.
+    // Why hardware_concurrency: To utilize available CPU cores efficiently for parallel processing.
+    // Why -2 if >4: This heuristic aims to leave some CPU cores free for other system tasks,
+    //               preventing the inference from completely starving the system.
+    uint32_t n_threads = std::thread::hardware_concurrency();
+    if (n_threads > 4) n_threads -= 2;
     
-    // Context parameters
-    g_ctx_params = llama_context_default_params();
-    const int trained_ctx = llama_model_n_ctx_train(g_model);
-    const int requested_ctx = (context_size > 0) ? context_size : DEFAULT_CONTEXT_SIZE;
+    // Configure context parameters.
+    // `n_ctx`: The maximum sequence length the model can handle.
+    //          A larger context allows the model to remember more of the conversation history.
+    ctx_params.n_ctx = 4096; 
+    ctx_params.n_threads = n_threads;       // Number of threads for general inference.
+    ctx_params.n_threads_batch = n_threads; // Number of threads for batch processing.
     
-    if (requested_ctx > trained_ctx) {
-        LOGw("Model trained with %d context, requesting %d - may cause issues", 
-             trained_ctx, requested_ctx);
-    }
+    LOGi("Initializing context with %u threads", n_threads);
     
-    g_ctx_params.n_ctx = requested_ctx;
-    g_ctx_params.n_batch = BATCH_SIZE;
-    g_ctx_params.n_ubatch = BATCH_SIZE;
-    g_ctx_params.n_threads = n_threads;
-    g_ctx_params.n_threads_batch = n_threads;
+    // Initialize the Llama context using the loaded model and configured parameters.
+    // The context holds the state of the inference process, including KV cache.
+    g_context = llama_init_from_model(g_model, ctx_params);
+    if (!g_context) return 1; // Return error if context initialization fails.
     
-    g_context = llama_init_from_model(g_model, g_ctx_params);
-    if (!g_context) {
-        LOGe("Failed to create context");
-        return 1;
-    }
+    // Initialize a Llama batch.
+    // Why batch: Allows processing multiple sequences or parts of a sequence efficiently.
+    //            In this case, it's used for adding tokens for decoding.
+    g_batch = llama_batch_init(512, 0, 1);
     
-    g_batch = llama_batch_init(BATCH_SIZE, 0, 1);
+    // Initialize chat templates for formatting prompts.
+    // Why chat templates: LLMs often require specific prompt formats (e.g., "[INST] user message [/INST]")
+    //                     to perform optimally. This component handles that formatting.
     g_chat_templates = common_chat_templates_init(g_model, "");
     
-    // Initialize sampler with defaults
+    // Initialize default sampling parameters.
     common_params_sampling sparams;
-    sparams.temp = DEFAULT_SAMPLER_TEMP;
-    sparams.top_p = DEFAULT_SAMPLER_TOP_P;
-    sparams.top_k = DEFAULT_SAMPLER_TOP_K;
-    sparams.penalty_repeat = DEFAULT_SAMPLER_PENALTY;
+    // Initialize the sampler with the model and sampling parameters.
+    // The sampler is responsible for selecting the next token based on model outputs
+    // and configured parameters like temperature, top_p, top_k.
     g_sampler = common_sampler_init(g_model, sparams);
     
-    // Reset position tracking
-    last_kv_pos = -1;
-    
-    LOGi("Context prepared successfully");
-    return 0;
+    return 0; // Success.
 }
 
-JNIEXPORT void JNICALL
-Java_com_arm_aichat_engine_InferenceEngineImpl_resetContextNative(JNIEnv *env, jobject) {
-    reset_long_term_states(true);
-    LOGi("Context reset complete");
-}
-
+/**
+ * @brief Updates the sampling parameters used for generating tokens.
+ *
+ * This function allows dynamic adjustment of parameters like temperature, top_p, top_k,
+ * and repetition penalty without reloading the entire model.
+ * These parameters significantly influence the creativity and coherence of the model's output.
+ *
+ * @param env Pointer to the JNI environment.
+ * @param jobject Unused.
+ * @param temp Temperature parameter: controls randomness (higher = more random).
+ * @param top_p Top-P (nucleus) sampling: considers the smallest set of tokens whose
+ *              cumulative probability exceeds 'top_p'.
+ * @param top_k Top-K sampling: considers only the 'top_k' most likely next tokens.
+ * @param penalty Repetition penalty: discourages the model from repeating tokens.
+ */
 JNIEXPORT void JNICALL
 Java_com_arm_aichat_engine_InferenceEngineImpl_updateSamplingParams(
     JNIEnv *env, jobject, jfloat temp, jfloat top_p, jint top_k, jfloat penalty) {
     
+    // Free the existing sampler to reinitialize with new parameters.
     if (g_sampler) {
         common_sampler_free(g_sampler);
     }
     
+    // Create and populate new sampling parameters.
     common_params_sampling sparams;
     sparams.temp = temp;
     sparams.top_p = top_p;
     sparams.top_k = top_k;
     sparams.penalty_repeat = penalty;
     
-    g_sampler = common_sampler_init(g_model, sparams);
-    LOGd("Sampling params updated: temp=%.2f, top_p=%.2f, top_k=%d, penalty=%.2f", 
+    LOGi("Updating Sampling Params: temp=%.2f, top_p=%.2f, top_k=%d, penalty=%.2f", 
          temp, top_p, top_k, penalty);
+    
+    // Initialize a new sampler with the updated parameters.
+    g_sampler = common_sampler_init(g_model, sparams);
 }
 
+/**
+ * @brief Retrieves system information about the Llama.cpp build.
+ *
+ * This can be useful for debugging or verifying the native library's capabilities.
+ *
+ * @param env Pointer to the JNI environment.
+ * @param jobject Unused.
+ * @return jstring A JNI string containing the system information.
+ */
 JNIEXPORT jstring JNICALL
 Java_com_arm_aichat_engine_InferenceEngineImpl_systemInfo(JNIEnv *env, jobject) {
+    // Call the native llama.cpp function to get system info and convert to JNI string.
     return env->NewStringUTF(llama_print_system_info());
 }
 
-JNIEXPORT jstring JNICALL
-Java_com_arm_aichat_engine_InferenceEngineImpl_benchModel(JNIEnv *env, jobject /*unused*/, 
-                                                          jint pp, jint tg, jint pl, jint nr) {
-    if (!g_model) {
-        return env->NewStringUTF("Model not loaded");
-    }
-    
-    auto pp_avg = 0.0;
-    auto tg_avg = 0.0;
-    auto pp_std = 0.0;
-    auto tg_std = 0.0;
-    
-    for (int nri = 0; nri < nr; nri++) {
-        LOGi("Benchmark run %d/%d: pp=%d, tg=%d", nri + 1, nr, pp, tg);
-        
-        // Create fresh context for each benchmark run
-        llama_context_params ctx_params = g_ctx_params;
-        ctx_params.n_ctx = pp + tg * pl + 64; // Ensure enough context
-        llama_context *ctx = llama_init_from_model(g_model, ctx_params);
-        if (!ctx) {
-            LOGe("Failed to create benchmark context");
-            continue;
-        }
-        
-        llama_batch bench_batch = llama_batch_init(BATCH_SIZE, 0, 1);
-        
-        // Prompt processing benchmark
-        common_batch_clear(bench_batch);
-        for (int i = 0; i < pp; i++) {
-            common_batch_add(bench_batch, 0, i, {0}, false);
-        }
-        bench_batch.logits[bench_batch.n_tokens - 1] = true;
-        
-        auto t_pp_start = ggml_time_us();
-        if (llama_decode(ctx, bench_batch) != 0) {
-            LOGe("llama_decode failed during prompt processing");
-        }
-        auto t_pp_end = ggml_time_us();
-        
-        // Text generation benchmark
-        auto t_tg_start = ggml_time_us();
-        for (int i = 0; i < tg; i++) {
-            common_batch_clear(bench_batch);
-            for (int j = 0; j < pl; j++) {
-                common_batch_add(bench_batch, 0, pp + i, {j}, true);
-            }
-            if (llama_decode(ctx, bench_batch) != 0) {
-                LOGe("llama_decode failed during text generation");
-            }
-        }
-        auto t_tg_end = ggml_time_us();
-        
-        llama_batch_free(bench_batch);
-        llama_free(ctx);
-        
-        double t_pp = double(t_pp_end - t_pp_start) / 1000000.0;
-        double t_tg = double(t_tg_end - t_tg_start) / 1000000.0;
-        
-        double speed_pp = double(pp) / t_pp;
-        double speed_tg = double(pl * tg) / t_tg;
-        
-        pp_avg += speed_pp;
-        tg_avg += speed_tg;
-        pp_std += speed_pp * speed_pp;
-        tg_std += speed_tg * speed_tg;
-        
-        LOGi("Run %d: pp %.2f t/s, tg %.2f t/s", nri + 1, speed_pp, speed_tg);
-    }
-    
-    // Calculate averages and standard deviations
-    pp_avg /= double(nr);
-    tg_avg /= double(nr);
-    
-    if (nr > 1) {
-        pp_std = sqrt(pp_std / double(nr - 1) - pp_avg * pp_avg * double(nr) / double(nr - 1));
-        tg_std = sqrt(tg_std / double(nr - 1) - tg_avg * tg_avg * double(nr) / double(nr - 1));
-    }
-    
-    char model_desc[128];
-    llama_model_desc(g_model, model_desc, sizeof(model_desc));
-    
-    double model_size = double(llama_model_size(g_model)) / 1024.0 / 1024.0 / 1024.0;
-    double model_n_params = double(llama_model_n_params(g_model)) / 1e9;
-    
-    std::string backend = get_backend();
-    std::stringstream result;
-    result << std::setprecision(3);
-    result << "| model | size | params | backend | test | t/s |\n";
-    result << "| --- | --- | --- | --- | --- | --- |\n";
-    result << "| " << model_desc << " | " << model_size << "GiB | " << model_n_params << "B | "
-           << backend << " | pp " << pp << " | " << pp_avg << " ± " << pp_std << " |\n";
-    result << "| " << model_desc << " | " << model_size << "GiB | " << model_n_params << "B | "
-           << backend << " | tg " << tg << " | " << tg_avg << " ± " << tg_std << " |\n";
-    
-    return env->NewStringUTF(result.str().c_str());
-}
-
+/**
+ * @brief Processes a system prompt, initializing the chat context.
+ *
+ * This function is typically called at the beginning of a conversation or to
+ * set a specific persona/instruction for the model. It clears previous chat history.
+ *
+ * Why clear chat_msgs: A system prompt usually signifies a fresh start or a
+ *                     change in the model's overall directive, making previous
+ *                     conversation irrelevant or potentially conflicting.
+ *
+ * @param env Pointer to the JNI environment.
+ * @param jobject Unused.
+ * @param jprompt JNI string containing the system prompt text.
+ * @return jint Returns 0 on success, 1 on failure during decoding.
+ */
 JNIEXPORT jint JNICALL
 Java_com_arm_aichat_engine_InferenceEngineImpl_processSystemPrompt(JNIEnv *env, jobject, jstring jprompt) {
+    // Convert Java string to C-style string.
     const char *prompt = env->GetStringUTFChars(jprompt, 0);
-    LOGi("Processing system prompt");
     
-    // Reset everything for new conversation
-    reset_long_term_states(true);
+    // Clear previous chat messages and reset position for a new context.
+    chat_msgs.clear();
+    current_position = 0;
     
-    // Format system prompt
-    std::string formatted_prompt(prompt);
-    bool has_chat_template = common_chat_templates_was_explicit(g_chat_templates.get());
+    // Create a new common_chat_msg for the system prompt.
+    common_chat_msg msg;
+    msg.role = "system"; // Mark as system message.
+    msg.content = prompt;
     
-    if (has_chat_template) {
-        formatted_prompt = chat_add_and_format(ROLE_SYSTEM, prompt);
+    // Format the system message using chat templates.
+    // Why formatting: Ensures the prompt adheres to the model's expected input structure.
+    auto formatted = common_chat_format_single(g_chat_templates.get(), chat_msgs, msg, false, false);
+    // Add the system message to the chat history.
+    chat_msgs.push_back(msg);
+    
+    // Tokenize the formatted prompt.
+    // `true, true`: These flags likely indicate adding beginning-of-sentence (BOS)
+    //                and end-of-sentence (EOS) tokens, crucial for model understanding.
+    auto tokens = common_tokenize(g_context, formatted, true, true);
+    
+    // Prepare the batch for decoding.
+    common_batch_clear(g_batch);
+    // Add tokens to the batch.
+    // Why `current_position + i`: Tokens are added sequentially to maintain their position
+    //                             within the overall context window.
+    for (int i = 0; i < tokens.size(); i++) {
+        common_batch_add(g_batch, tokens[i], current_position + i, {0}, false);
     }
     
-    // Tokenize
-    auto tokens = common_tokenize(g_context, formatted_prompt, has_chat_template, has_chat_template);
+    // Decode the batch of tokens. This performs the forward pass through the model
+    // to update its internal state (KV cache) based on the prompt.
+    if (llama_decode(g_context, g_batch) != 0) return 1;
     
-    // Check context size
-    const int max_size = g_ctx_params.n_ctx - OVERFLOW_HEADROOM;
-    if ((int) tokens.size() > max_size) {
-        LOGe("System prompt too long: %d tokens, max %d", (int) tokens.size(), max_size);
-        env->ReleaseStringUTFChars(jprompt, prompt);
-        return 1;
-    }
-    
-    // Decode starting from position 0
-    if (decode_tokens_in_batches(tokens, 0, false) != 0) {
-        env->ReleaseStringUTFChars(jprompt, prompt);
-        return 2;
-    }
-    
-    // Update positions
-    current_position = tokens.size();
-    system_prompt_position = current_position;
-    
-    env->ReleaseStringUTFChars(jprompt, prompt);
-    LOGi("System prompt processed, position: %d", current_position);
-    return 0;
-}
-
-JNIEXPORT jint JNICALL
-Java_com_arm_aichat_engine_InferenceEngineImpl_processUserPrompt(JNIEnv *env, jobject, 
-                                                                 jstring jprompt, jint n_predict) {
-    const char *prompt = env->GetStringUTFChars(jprompt, 0);
-    LOGi("Processing user prompt, n_predict=%d, current_position=%d", n_predict, current_position);
-    
-    // Reset short-term states
-    reset_short_term_states();
-    
-    // Format user prompt
-    std::string formatted_prompt(prompt);
-    bool has_chat_template = common_chat_templates_was_explicit(g_chat_templates.get());
-    
-    if (has_chat_template) {
-        formatted_prompt = chat_add_and_format(ROLE_USER, prompt);
-    }
-    
-    // Tokenize
-    auto tokens = common_tokenize(g_context, formatted_prompt, has_chat_template, has_chat_template);
-    
-    // Truncate if too long
-    const int max_size = g_ctx_params.n_ctx - current_position - OVERFLOW_HEADROOM;
-    if ((int) tokens.size() > max_size) {
-        int skipped = tokens.size() - max_size;
-        tokens.resize(max_size);
-        LOGw("User prompt truncated, skipped %d tokens", skipped);
-    }
-    
-    // CRITICAL FIX: Decode with last logit for generation, starting from current_position
-    if (decode_tokens_in_batches(tokens, current_position, true) != 0) {
-        env->ReleaseStringUTFChars(jprompt, prompt);
-        return 2;
-    }
-    
-    // Update positions
+    // Update the current position to reflect the newly processed tokens.
     current_position += tokens.size();
-    stop_generation_position = current_position + n_predict;
-    
+    // Release the C-style string resource.
     env->ReleaseStringUTFChars(jprompt, prompt);
-    LOGi("User prompt processed, current position: %d, stop at: %d, last_kv_pos: %d", 
-         current_position, stop_generation_position, last_kv_pos);
-    return 0;
+    return 0; // Success.
 }
 
+/**
+ * @brief Processes a user prompt, appending it to the chat context.
+ *
+ * This function takes user input, formats it, tokenizes it, and feeds it into the Llama model
+ * to prepare for generating a response.
+ *
+ * @param env Pointer to the JNI environment.
+ * @param jobject Unused.
+ * @param jprompt JNI string containing the user prompt text.
+ * @param n_predict Unused in this function's scope, likely intended for response generation.
+ * @return jint Returns 0 on success, 1 on failure during decoding.
+ */
+JNIEXPORT jint JNICALL
+Java_com_arm_aichat_engine_InferenceEngineImpl_processUserPrompt(JNIEnv *env, jobject, jstring jprompt, jint n_predict) {
+    // Convert Java string to C-style string.
+    const char *prompt = env->GetStringUTFChars(jprompt, 0);
+    
+    // Create a new common_chat_msg for the user prompt.
+    common_chat_msg new_msg;
+    new_msg.role = "user"; // Mark as user message.
+    new_msg.content = prompt;
+    
+    // Format the user message and existing chat history using chat templates.
+    // Why `true, false` for last two args: The `true` likely indicates that
+    // this is a "full" format including history, and `false` might mean not to
+    // add an EOS token yet as the user is still conversing.
+    auto formatted = common_chat_format_single(g_chat_templates.get(), chat_msgs, new_msg, true, false);
+    // Add the new user message to the chat history.
+    chat_msgs.push_back(new_msg);
+    
+    // Tokenize the formatted prompt.
+    // `true, true`: Similar to system prompt, likely adds BOS/EOS tokens for parsing.
+    auto tokens = common_tokenize(g_context, formatted, true, true);
+    
+    // Prepare the batch for decoding.
+    common_batch_clear(g_batch);
+    // Add tokens to the batch.
+    // Why `i == tokens.size() - 1`: The last token in the batch is marked as a "prompt"
+    //                              token, meaning its logits will be computed for sampling.
+    //                              Other tokens are typically "past" tokens.
+    for (int i = 0; i < tokens.size(); i++) {
+        common_batch_add(g_batch, tokens[i], current_position + i, {0}, i == tokens.size() - 1);
+    }
+    
+    // Decode the batch of tokens to update the model's internal state.
+    if (llama_decode(g_context, g_batch) != 0) return 1;
+    
+    // Update the current position.
+    current_position += tokens.size();
+    // Release the C-style string resource.
+    env->ReleaseStringUTFChars(jprompt, prompt);
+    return 0; // Success.
+}
+
+/**
+ * @brief Generates the next token in the sequence.
+ *
+ * This function performs the core "thinking" step of the model, sampling a new token
+ * based on the current context and sampling parameters.
+ *
+ * @param env Pointer to the JNI environment.
+ * @param jobject Unused.
+ * @return jstring A JNI string representing the generated token piece, or nullptr if EOG is reached or decode fails.
+ */
 JNIEXPORT jstring JNICALL
 Java_com_arm_aichat_engine_InferenceEngineImpl_generateNextToken(JNIEnv *env, jobject) {
-    // Check if we've reached stop position
-    if (stop_generation_position > 0 && current_position >= stop_generation_position) {
-        LOGi("Reached stop position %d", stop_generation_position);
-        return nullptr;
-    }
+    // Sample the next token ID from the model's output logits.
+    // `g_sampler`: Manages sampling strategy (temp, top_p, top_k, etc.).
+    // `g_context`: Provides the model's current state and logits.
+    // `-1`: Likely refers to the last token in the batch for which logits were computed.
+    const auto id = common_sampler_sample(g_sampler, g_context, -1);
     
-    // CRITICAL FIX: Verify position continuity before generation
-    if (last_kv_pos >= 0 && current_position != last_kv_pos + 1) {
-        LOGw("Position mismatch before generation: last_kv_pos=%d, current_position=%d", 
-             last_kv_pos, current_position);
-        // Adjust current_position to match KV cache
-        current_position = last_kv_pos + 1;
-    }
+    // Accept the sampled token, potentially updating internal sampler state.
+    common_sampler_accept(g_sampler, id, true);
     
-    // Sample next token
-    const auto new_token_id = common_sampler_sample(g_sampler, g_context, -1);
-    common_sampler_accept(g_sampler, new_token_id, true);
+    // Check if the sampled token is an End-Of-Generation (EOG) token.
+    // Why EOG check: To know when the model has finished its response and stop generation.
+    if (llama_vocab_is_eog(llama_model_get_vocab(g_model), id)) return nullptr;
     
-    // Check for end of generation
-    if (llama_vocab_is_eog(llama_model_get_vocab(g_model), new_token_id)) {
-        LOGd("EOG token generated, stopping");
-        if (assistant_ss.tellp() > 0) {
-            chat_add_and_format(ROLE_ASSISTANT, assistant_ss.str());
-        }
-        return nullptr;
-    }
-    
-    // Decode the new token at the correct position
+    // Prepare a new batch containing only the newly generated token.
     common_batch_clear(g_batch);
-    common_batch_add(g_batch, new_token_id, current_position, {0}, true);
+    // Add the generated token to the batch.
+    // `true`: Mark this as a "prompt" token so its logits will be computed for the *next* sampling step.
+    common_batch_add(g_batch, id, current_position, {0}, true);
     
-    LOGv("Generating token %d at position %d", new_token_id, current_position);
+    // Decode the single-token batch. This updates the KV cache with the new token,
+    // preparing the model for the next sampling step.
+    if (llama_decode(g_context, g_batch) != 0) return nullptr;
     
-    if (llama_decode(g_context, g_batch) != 0) {
-        LOGe("llama_decode failed for generated token");
-        return nullptr;
-    }
-    
-    // Update position tracking
-    last_kv_pos = current_position;
+    // Increment the current position in the context.
     current_position++;
     
-    // Convert token to text with UTF-8 handling
-    auto new_chars = common_token_to_piece(g_context, new_token_id);
-    cached_token_chars += new_chars;
-    
-    // Return valid UTF-8 strings
-    jstring result = nullptr;
-    if (is_valid_utf8(cached_token_chars.c_str())) {
-        result = env->NewStringUTF(cached_token_chars.c_str());
-        assistant_ss << cached_token_chars;
-        cached_token_chars.clear();
-        LOGv("Generated token: %s", result ? "valid UTF-8" : "null");
-    } else {
-        // Return empty string for partial UTF-8
-        result = env->NewStringUTF("");
-        LOGv("Partial UTF-8, caching");
-    }
-    
-    return result;
+    // Convert the token ID back into a human-readable string piece.
+    auto piece = common_token_to_piece(g_context, id);
+    // Return the string piece as a JNI string.
+    return env->NewStringUTF(piece.c_str());
 }
 
-JNIEXPORT jstring JNICALL
-Java_com_arm_aichat_engine_InferenceEngineImpl_getCurrentAssistantMessageNative(JNIEnv *env, jobject) {
-    std::string current = assistant_ss.str();
-    if (!current.empty()) {
-        return env->NewStringUTF(current.c_str());
-    }
-    return nullptr;
-}
-
+/**
+ * @brief Unloads the Llama model and frees associated resources.
+ *
+ * This function is crucial for releasing memory and other system resources
+ * when the model is no longer needed, preventing resource leaks.
+ *
+ * @param env Pointer to the JNI environment.
+ * @param jobject Unused.
+ */
 JNIEXPORT void JNICALL
 Java_com_arm_aichat_engine_InferenceEngineImpl_unload(JNIEnv *env, jobject) {
-    LOGi("Unloading model and freeing resources");
+    // Free resources in reverse order of allocation to ensure dependencies are met.
+    if (g_sampler) common_sampler_free(g_sampler);
+    if (g_context) llama_free(g_context);
+    if (g_model) llama_model_free(g_model);
+    llama_batch_free(g_batch); // g_batch is not a pointer, so direct free.
     
-    reset_long_term_states(false);
-    
-    if (g_sampler) {
-        common_sampler_free(g_sampler);
-        g_sampler = nullptr;
-    }
-    
-    g_chat_templates.reset();
-    
-    if (g_context) {
-        llama_free(g_context);
-        g_context = nullptr;
-    }
-    
-    if (g_model) {
-        llama_model_free(g_model);
-        g_model = nullptr;
-    }
-    
-    llama_batch_free(g_batch);
-    current_position = 0;
-    last_kv_pos = -1;
-    
-    LOGi("Unload complete");
+    // Reset global pointers to nullptr to indicate resources are freed and prevent dangling pointers.
+    g_sampler = nullptr;
+    g_context = nullptr;
+    g_model = nullptr;
 }
 
+/**
+ * @brief Shuts down the Llama backend.
+ *
+ * This is the final cleanup step for the native library, releasing any
+ * global resources initialized by `llama_backend_init()`.
+ *
+ * @param env Pointer to the JNI environment.
+ * @param jobject Unused.
+ */
 JNIEXPORT void JNICALL
 Java_com_arm_aichat_engine_InferenceEngineImpl_shutdown(JNIEnv *env, jobject) {
-    LOGi("Shutting down llama.cpp backend");
+    // Perform final cleanup of the llama.cpp backend.
     llama_backend_free();
 }
 
