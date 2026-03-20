@@ -43,7 +43,7 @@ import java.io.IOException
  *
  * @see ai_chat.cpp for the native implementation details
  */
-internal class InferenceEngineImpl private constructor(
+class InferenceEngineImpl private constructor(
     private val nativeLibDir: String
 ) : InferenceEngine {
 

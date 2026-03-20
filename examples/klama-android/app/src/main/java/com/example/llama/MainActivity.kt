@@ -23,6 +23,8 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.onCompletion
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import okio.buffer
+import okio.source
 import java.io.File
 import java.io.FileOutputStream
 import java.io.InputStream
@@ -95,21 +97,29 @@ class MainActivity : AppCompatActivity() {
         ggufTv.text = "Parsing metadata from selected file \n$uri"
 
         lifecycleScope.launch(Dispatchers.IO) {
-            // Parse GGUF metadata
+            // Parse GGUF metadata using Okio
             Log.i(TAG, "Parsing GGUF metadata...")
-            contentResolver.openInputStream(uri)?.use {
-                GgufMetadataReader.create().readStructuredMetadata(it)
-            }?.let { metadata ->
+            
+            val metadata = try {
+                contentResolver.openInputStream(uri)?.use {
+                    GgufMetadataReader.create().readStructuredMetadata(it.source().buffer())
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to parse GGUF metadata", e)
+                null
+            }
+            
+            metadata?.let { meta ->
                 // Update UI to show GGUF metadata to user
-                Log.i(TAG, "GGUF parsed: \n$metadata")
+                Log.i(TAG, "GGUF parsed: \n$meta")
                 withContext(Dispatchers.Main) {
-                    ggufTv.text = metadata.toString()
+                    ggufTv.text = meta.toString()
                 }
 
                 // Ensure the model file is available
                 val modelName = metadata.filename() + FILE_EXTENSION_GGUF
-                contentResolver.openInputStream(uri)?.use { input ->
-                    ensureModelFile(modelName, input)
+                contentResolver.openInputStream(uri)?.use {
+                    ensureModelFile(modelName, it)
                 }?.let { modelFile ->
                     loadModel(modelName, modelFile)
 
@@ -182,13 +192,13 @@ class MainActivity : AppCompatActivity() {
                                 userInputEt.isEnabled = true
                                 userActionFab.isEnabled = true
                             }
-                        }.collect { token ->
+                        }.collect {
                             withContext(Dispatchers.Main) {
                                 val messageCount = messages.size
                                 check(messageCount > 0 && !messages[messageCount - 1].isUser)
 
                                 messages.removeAt(messageCount - 1).copy(
-                                    content = lastAssistantMsg.append(token).toString()
+                                    content = lastAssistantMsg.append(it).toString()
                                 ).let { messages.add(it) }
 
                                 messageAdapter.notifyItemChanged(messages.size - 1)

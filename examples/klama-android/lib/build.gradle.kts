@@ -26,7 +26,7 @@ val cloneLlamaCppIfNeeded by tasks.registering(Exec::class) {
 
 android {
     namespace = "com.arm.aichat"
-    compileSdk = 36
+    compileSdk = 35
 
     ndkVersion = "29.0.13113456"
 
@@ -98,6 +98,7 @@ tasks.matching { it.name.contains("externalNativeBuild", ignoreCase = true) }.co
 dependencies {
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.datastore.preferences)
+    implementation("com.squareup.okio:okio:3.9.0")
 
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)

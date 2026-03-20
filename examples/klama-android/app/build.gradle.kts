@@ -5,13 +5,13 @@ plugins {
 
 android {
     namespace = "com.example.llama"
-    compileSdk = 36
+    compileSdk = 35
 
     defaultConfig {
         applicationId = "com.example.llama.aichat"
 
         minSdk = 33
-        targetSdk = 36
+        targetSdk = 35
 
         versionCode = 1
         versionName = "1.0"

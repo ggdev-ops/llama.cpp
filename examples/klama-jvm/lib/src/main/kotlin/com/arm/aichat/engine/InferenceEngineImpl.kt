@@ -5,7 +5,7 @@ import kotlinx.coroutines.flow.*
 import java.io.File
 import java.io.IOException
 
-internal class InferenceEngineImpl() : InferenceEngine {
+class InferenceEngineImpl() : InferenceEngine {
 
     companion object {
         private const val TAG = "InferenceEngine"

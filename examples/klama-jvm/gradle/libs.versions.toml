@@ -1,0 +1,49 @@
+[versions]
+# Core
+kotlin = "2.3.10"
+javaVersion = "21"
+kotlinx-coroutines = "1.10.2"
+kotlinx-serialization = "1.10.0"
+
+# Logging
+logback-classic = "1.4.14"
+slf4j = "2.0.12"
+kotlin-logging = "3.0.5"
+
+# CLI & UI
+clikt = "4.4.0"
+kotter = "1.2.1"
+
+# AI - Project Specific
+#koog = "0.6.3"
+
+# Build & Development
+detekt = "1.23.8"
+
+[libraries]
+# ---------- KOTLIN & COROUTINES ----------
+kotlinx-coroutines = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version.ref = "kotlinx-coroutines" }
+
+# ---------- SERIALIZATION ----------
+kotlinx-serialization-json = { module = "org.jetbrains.kotlinx:kotlinx-serialization-json", version.ref = "kotlinx-serialization" }
+
+# ---------- LOGGING ----------
+logback-classic = { module = "ch.qos.logback:logback-classic", version.ref = "logback-classic" }
+slf4j-api = { module = "org.slf4j:slf4j-api", version.ref = "slf4j" }     kotlin-logging = { module = "io.github.microutils:kotlin-logging", version.ref = "kotlin-logging" }
+
+# ---------- AI (KOOG) - Project Specific ----------
+#koog-agents = { module = "ai.koog:koog-agents", version.ref = "koog" }
+
+# ---------- CLI & UI ----------
+clikt = { module = "com.github.ajalt.clikt:clikt", version.ref = "clikt" }
+kotter = { module = "com.varabyte.kotter:kotter", version.ref = "kotter" }
+kotter-jvm = { module = "com.varabyte.kotter:kotter-jvm", version.ref = "kotter" }
+
+[plugins]
+# ---------- KOTLIN PLUGINS ----------
+kotlin-jvm = { id = "org.jetbrains.kotlin.jvm", version.ref = "kotlin" }
+#kotlin-multiplatform = { id = "org.jetbrains.kotlin.multiplatform", version.ref = "kotlin" }
+#kotlinx-serialization = { id = "org.jetbrains.kotlin.plugin.serialization", version.ref = "kotlin" }
+
+# ---------- LINTING ----------
+detekt = { id = "io.gitlab.arturbosch.detekt", version.ref = "detekt" }

@@ -8,7 +8,7 @@ import java.io.IOException
 /**
  * Optimized GGUF parser using Okio for unified multi-platform I/O.
  */
-internal class GgufMetadataReaderImpl(
+class GgufMetadataReaderImpl(
     private val skipKeys: Set<String>,
     private val arraySummariseThreshold: Int,
 ) : GgufMetadataReader {
