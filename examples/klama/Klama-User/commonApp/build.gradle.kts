@@ -18,7 +18,7 @@ repositories {
 
 kotlin {
     androidLibrary {
-        namespace = "klama.ai.compose.common"
+        namespace = "ai.llm.common"
         compileSdk = libs.versions.android.compileSdk.get().toInt()
         minSdk = libs.versions.android.minSdk.get().toInt()
     }
@@ -45,7 +45,8 @@ kotlin {
             implementation(libs.compose.uiTooling)
             implementation(libs.androidx.lifecycle.viewmodelCompose)
             implementation(libs.androidx.lifecycle.runtimeCompose)
-            implementation("io.github.kotlin:library:1.0.0")
+            implementation("ai.kgguf:library:1.0.0")
+            api("klama.ai:lib:1.0.0-SNAPSHOT")
             implementation(libs.okio)
             implementation(libs.androidx.datastore.preferences)
             implementation(libs.kotlinx.coroutines.core)

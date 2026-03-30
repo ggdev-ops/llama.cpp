@@ -16,9 +16,9 @@
 - `androidApp`: Android-specific implementation and JNI/C++ bridge.
 - `desktopApp`: Desktop-specific implementation for Windows, macOS, and Linux.
 - `commonApp`: Shared Compose UI, ViewModels, and domain logic.
-  - `klama.ai.compose.engine`: Interface for the native inference engine.
-  - `klama.ai.compose.io`: Platform-specific file picking and storage management.
-  - `klama.ai.compose.domain`: Business logic for model management and chat.
+  - `ai.llm.engine`: Interface for the native inference engine.
+  - `ai.llm.io`: Platform-specific file picking and storage management.
+  - `ai.llm.domain`: Business logic for model management and chat.
 
 ---
 

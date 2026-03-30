@@ -1,31 +1,13 @@
-import org.gradle.api.tasks.Exec
 plugins {
     alias(libs.plugins.androidApplication)
     alias(libs.plugins.composeMultiplatform)
     alias(libs.plugins.composeCompiler)
+    kotlin("android")
 }
 
-val llamaDir = file("build/llama.cpp")
-
-val cloneLlamaCppIfNeeded by tasks.registering(Exec::class) {
-    inputs.property("llamaDirExists", llamaDir.exists())
-    outputs.dir(llamaDir)
-    onlyIf { !llamaDir.exists() }
-    commandLine("git", "clone", "https://github.com/ggerganov/llama.cpp.git", llamaDir.absolutePath)
-    doFirst {
-        println("Cloning llama.cpp to $llamaDir...")
-        llamaDir.parentFile.mkdirs()
-    }
-    doLast {
-        if (!llamaDir.exists()) {
-            throw GradleException("Failed to clone llama.cpp to $llamaDir")
-        }
-        println("llama.cpp cloned successfully.")
-    }
-}
 
 android {
-    namespace = "klama.ai.compose"
+    namespace = "ai.llm"
     compileSdk = 36
 
     ndkVersion = "29.0.14206865"
@@ -37,7 +19,7 @@ android {
     }
 
     defaultConfig {
-        applicationId = "klama.ai.compose"
+        applicationId = "ai.llm"
         minSdk = 33
         targetSdk = 36
         versionCode = 1
@@ -46,33 +28,10 @@ android {
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
         ndk {
-            abiFilters += listOf("arm64-v8a")
-        }
-        externalNativeBuild {
-            cmake {
-                arguments += "-DLLAMA_SRC=${llamaDir.absolutePath}"
-                arguments += "-DCMAKE_BUILD_TYPE=Release"
-                arguments += "-DCMAKE_MESSAGE_LOG_LEVEL=DEBUG"
-                arguments += "-DCMAKE_VERBOSE_MAKEFILE=ON"
-
-                arguments += "-DBUILD_SHARED_LIBS=ON"
-                arguments += "-DLLAMA_BUILD_COMMON=ON"
-                arguments += "-DLLAMA_OPENSSL=OFF"
-
-                arguments += "-DGGML_NATIVE=OFF"
-                arguments += "-DGGML_BACKEND_DL=ON"
-                arguments += "-DGGML_CPU_ALL_VARIANTS=ON"
-                arguments += "-DGGML_LLAMAFILE=OFF"
-            }
+            abiFilters += listOf("arm64-v8a", "x86_64")
         }
     }
     
-    externalNativeBuild {
-        cmake {
-            path("src/main/cpp/CMakeLists.txt")
-            version = "3.31.6"
-        }
-    }
     
     buildFeatures {
         compose = true
@@ -82,10 +41,6 @@ android {
         sourceCompatibility = JavaVersion.VERSION_21
         targetCompatibility = JavaVersion.VERSION_21
     }
-    
-    kotlin {
-        jvmToolchain(21)
-    }
 
     packaging {
         resources {
@@ -94,9 +49,10 @@ android {
     }
 }
 
-tasks.matching { it.name.contains("externalNativeBuild", ignoreCase = true) }.configureEach {
-    dependsOn(cloneLlamaCppIfNeeded)
+kotlin {
+    jvmToolchain(21)
 }
+
 
 dependencies {
     implementation(project(":commonApp"))

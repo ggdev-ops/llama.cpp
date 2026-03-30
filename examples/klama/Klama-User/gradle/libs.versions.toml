@@ -1,4 +1,5 @@
 [versions]
+vanniktechMavenPublish = "0.34.0"
 agp = "9.0.1"
 android-compileSdk = "36"
 android-minSdk = "33"
@@ -49,6 +50,7 @@ okio = { module = "com.squareup.okio:okio", version.ref = "okio" }
 androidx-datastore-preferences = { module = "androidx.datastore:datastore-preferences", version.ref = "datastore" }
 
 [plugins]
+vanniktech-mavenPublish = { id = "com.vanniktech.maven.publish", version.ref = "vanniktechMavenPublish" }
 androidApplication = { id = "com.android.application", version.ref = "agp" }
 androidLibrary = { id = "com.android.library", version.ref = "agp" }
 androidKmpLibrary = { id = "com.android.kotlin.multiplatform.library", version.ref = "agp" }

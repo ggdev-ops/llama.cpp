@@ -34,11 +34,7 @@ plugins {
 }
 
 include(
-
     ":androidApp",
-
     ":desktopApp",
-
     ":commonApp",
-
 )

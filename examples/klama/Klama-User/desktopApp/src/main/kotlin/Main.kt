@@ -1,13 +1,13 @@
-package klama.ai.compose
+package ai.llm
 
 import androidx.compose.ui.window.Window
 import androidx.compose.ui.window.application
-import klama.ai.compose.engine.EngineSamplingParams
-import klama.ai.compose.engine.EngineState
-import klama.ai.compose.engine.InferenceEngine
-import klama.ai.compose.engine.JvmEngineBridgeHooks
-import klama.ai.compose.engine.internal.InferenceEngineImpl
-import klama.ai.compose.engine.updateJvmEngineState
+import ai.llm.engine.EngineSamplingParams
+import ai.llm.engine.EngineState
+import klama.ai.engine.InferenceEngine
+import ai.llm.engine.JvmEngineBridgeHooks
+import klama.ai.engine.InferenceEngineImpl
+import ai.llm.engine.updateJvmEngineState
 import kotlinx.coroutines.MainScope
 import kotlinx.coroutines.launch
 
@@ -45,7 +45,7 @@ fun main() {
                 is InferenceEngine.State.ProcessingSystemPrompt -> EngineState.ProcessingSystemPrompt
                 is InferenceEngine.State.ProcessingUserPrompt -> EngineState.ProcessingUserPrompt
                 is InferenceEngine.State.Generating -> EngineState.Generating
-                is InferenceEngine.State.Error -> EngineState.Error(state.throwable.message)
+                is InferenceEngine.State.Error -> EngineState.Error(state.exception.message)
             }
             updateJvmEngineState(engineState)
         }
